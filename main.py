@@ -4,17 +4,20 @@ Agnes 生成工作台 — FastAPI 后端
 
 职责：
   1. 持有 API Key（.env），代理 Agnes 图像接口（文生图 / 图生图 / 多图合成）
-  2. 结果 URL 秒级失效，故生成成功后立即下载落盘到 outputs/
-  3. 托管 static/ 单页前端
+  2. 代理 Agnes 视频接口（文生视频 / 首尾帧 / 图生视频 / 音频参考，异步任务轮询）
+  3. 结果 URL 秒级失效，故生成成功后立即下载落盘到 outputs/
+  4. 托管 static/ 单页前端
 
 启动：python main.py  （默认 http://127.0.0.1:8000）
 """
 import json
 import mimetypes
 import os
+import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
 from pathlib import Path
 from urllib.parse import quote
 
@@ -33,11 +36,25 @@ load_dotenv(ROOT / ".env")
 AGNES_BASE = os.getenv("AGNES_BASE_URL", "https://apihub.agnes-ai.com/v1").rstrip("/")
 AGNES_KEY = os.getenv("AGNES_API_KEY", "").strip()
 MODEL_IMAGE = "agnes-image-2.5-flash"
+MODEL_VIDEO = "agnes-video-2.5-flash"
+VIDEO_POLL_BASE = "https://apihub.agnes-ai.com/agnesapi"
 MEDIA_HOSTS = ("platform-outputs.agnes-ai.space", "storage.googleapis.com", "apihub.agnes-ai.com")
 MEDIA_TIMEOUT = 120
 GEN_TIMEOUT = 300
+VIDEO_TIMEOUT = 45          # 创建请求本身应秒回，挂起就快速失败重试
+VIDEO_MAX_WAIT = 600        # 单个视频任务最长轮询 10 分钟
+VIDEO_POLL_INTERVAL = 3     # 后端线程内轮询间隔
+VIDEO_RETRY_WAITS = (30, 60, 90)  # 创建任务遇 503 拥堵 / 429 限速的等待秒数
 
 OUTPUTS_DIR.mkdir(exist_ok=True)
+
+# 视频固定 720P，各 aspect_ratio -> 输出像素（与 API 文档一致）
+VIDEO_DIMS = {
+    "21:9": "1680x720", "16:9": "1280x720", "4:3": "960x720",
+    "1:1": "720x720", "3:4": "720x960", "9:16": "720x1280",
+}
+VIDEO_RATIOS = tuple(VIDEO_DIMS.keys())
+VIDEO_SECONDS = tuple(str(s) for s in range(4, 13))  # "4"–"12"，字符串
 
 # size 档位 × ratio -> 预期输出像素（与 API 文档一致）
 DIMS = {
@@ -77,6 +94,26 @@ class MultiImageBody(BaseModel):
     images: list[str]               # 2 张及以上
     size: str = "1K"
     ratio: str = "1:1"
+
+
+class VideoBaseBody(BaseModel):
+    prompt: str
+    seconds: str = "4"              # 字符串 "4"–"12"
+    aspect_ratio: str = "16:9"
+
+
+class TextToVideoBody(VideoBaseBody):
+    pass
+
+
+class KeyframeVideoBody(VideoBaseBody):
+    first_frame: str
+    last_frame: str = ""            # 可选
+
+
+class ReferenceVideoBody(VideoBaseBody):
+    images: list[str] = []          # ≤5
+    audios: list[str] = []          # ≤3
 
 
 # ---------- 工具函数 ----------
@@ -126,15 +163,19 @@ def _agnes_generate(payload: dict) -> dict:
             except Exception:
                 pass
             last_detail = json.dumps(raw, ensure_ascii=False)
-            # 队列拥堵：等待后重试
-            if e.code == 503 and "queue" in last_detail.lower() and attempt < len(retry_waits):
+            # 队列拥堵（503）或免费账号限速（429）：等待后重试
+            retryable = (e.code == 503 and "queue" in last_detail.lower()) or e.code == 429
+            if retryable and attempt < len(retry_waits):
                 wait = retry_waits[attempt]
-                print(f"[ Agnes 队列拥堵 ] 第 {attempt + 1} 次重试，等待 {wait}s ...", flush=True)
+                reason = "队列拥堵" if e.code == 503 else "免费账号限速(429)"
+                print(f"[ Agnes 图像{reason} ] 第 {attempt + 1} 次重试，等待 {wait}s ...", flush=True)
                 time.sleep(wait)
                 continue
             if e.code == 503:
                 raise HTTPException(503, "Agnes 服务繁忙（队列已满），已自动重试 "
                                         f"{attempt} 次仍失败，请稍后再试")
+            if e.code == 429:
+                raise HTTPException(429, "已触发 Agnes 免费账号速率限制，请稍等几分钟再试")
             raise HTTPException(502, f"Agnes 接口返回 HTTP {e.code}：{last_detail[:400]}")
         except Exception as e:
             raise HTTPException(502, f"Agnes 接口调用失败：{e!r}")
@@ -142,10 +183,12 @@ def _agnes_generate(payload: dict) -> dict:
 
 
 def _download(url: str) -> tuple[bytes, str]:
-    """下载结果图片，返回 (字节, content-type)"""
+    """下载结果图片/视频，返回 (字节, content-type)"""
     if not url.startswith("https://"):
         raise HTTPException(502, f"结果 URL 非 HTTPS，拒绝下载：{url[:80]}")
-    if not any(host in url for host in MEDIA_HOSTS):
+    # 信任域名白名单：已知 CDN + 兜底（含 agnes-ai / googleapis 的任意子域，视频结果域名未经实测）
+    trusted = any(host in url for host in MEDIA_HOSTS) or "agnes-ai" in url or "googleapis" in url
+    if not trusted:
         raise HTTPException(502, f"结果 URL 不在信任域名白名单：{url[:80]}")
     req = urllib.request.Request(url, method="GET")
     try:
@@ -157,7 +200,14 @@ def _download(url: str) -> tuple[bytes, str]:
 
 def _save(data: bytes, content_type: str, prefix: str) -> str:
     """落盘 outputs/，返回文件名"""
-    ext = ".jpg" if "jpeg" in content_type or "jpg" in content_type else ".png"
+    if "jpeg" in content_type or "jpg" in content_type:
+        ext = ".jpg"
+    elif "mp4" in content_type or "video" in content_type:
+        ext = ".mp4"
+    elif "wav" in content_type or "audio" in content_type:
+        ext = ".wav"
+    else:
+        ext = ".png"
     name = "%s_%s%s" % (prefix, time.strftime("%Y%m%d_%H%M%S"), ext)
     (OUTPUTS_DIR / name).write_bytes(data)
     return name
@@ -239,6 +289,267 @@ def multi_image(body: MultiImageBody):
         },
     })
     return _finish(resp, body.size, body.ratio, t0, "multi")
+
+
+# ---------- 视频接口 ----------
+
+def _check_video_params(seconds: str, aspect_ratio: str):
+    if seconds not in VIDEO_SECONDS:
+        raise HTTPException(400, f"视频时长 seconds={seconds!r} 非法，可选：{', '.join(VIDEO_SECONDS)}（字符串）")
+    if aspect_ratio not in VIDEO_DIMS:
+        raise HTTPException(400, f"不支持的宽高比 aspect_ratio={aspect_ratio!r}，可选：{', '.join(VIDEO_RATIOS)}")
+
+
+def _check_media(value: str, field: str, kind: str) -> str:
+    """视频输入媒体只接受 Data URI（data:image/ 或 data:audio/）或公网 http(s) URL"""
+    if not isinstance(value, str) or not value.strip():
+        raise HTTPException(400, f"{field} 不能为空")
+    value = value.strip()
+    prefix = "data:image/" if kind == "image" else "data:audio/"
+    if value.startswith(prefix):
+        return value
+    if value.startswith("http://") or value.startswith("https://"):
+        return value
+    raise HTTPException(400, f"{field} 需为公网 URL 或 {prefix} 开头的 Data URI")
+
+
+def _agnes_create_video(payload: dict, job: dict | None = None) -> str:
+    """创建视频任务，返回 video_id。503 队列拥堵 / 429 限速时自动退避重试。
+    job 非空时，把重试进度写进 job（供前端展示）。"""
+    _check_key()
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    last_detail = ""
+    for attempt in range(len(VIDEO_RETRY_WAITS) + 1):
+        if job is not None:
+            job["create_attempt"] = attempt
+        req = urllib.request.Request(AGNES_BASE + "/videos", data=body, method="POST")
+        req.add_header("Authorization", "Bearer " + AGNES_KEY)
+        req.add_header("Content-Type", "application/json")
+        try:
+            with urllib.request.urlopen(req, timeout=VIDEO_TIMEOUT) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                vid = data.get("video_id") or data.get("id") or data.get("task_id")
+                if not vid:
+                    raise HTTPException(502, f"Agnes 创建响应中未找到 video_id：{json.dumps(data, ensure_ascii=False)[:300]}")
+                return str(vid)
+        except urllib.error.HTTPError as e:
+            raw = e.read().decode("utf-8", "replace")
+            try:
+                raw = json.loads(raw)
+            except Exception:
+                pass
+            last_detail = json.dumps(raw, ensure_ascii=False)
+            # 队列拥堵（503）或免费账号限速（429）：等待后重试
+            retryable = (e.code == 503 and "queue" in last_detail.lower()) or e.code == 429
+            if retryable and attempt < len(VIDEO_RETRY_WAITS):
+                wait = VIDEO_RETRY_WAITS[attempt]
+                reason = "队列拥堵" if e.code == 503 else "免费账号限速(429)"
+                print(f"[ Agnes 视频{reason} ] 第 {attempt + 1} 次重试，等待 {wait}s ...", flush=True)
+                time.sleep(wait)
+                continue
+            if e.code == 503:
+                raise HTTPException(503, "Agnes 视频队列已满，已自动重试 "
+                                        f"{attempt} 次仍失败，请稍后再试")
+            if e.code == 429:
+                raise HTTPException(429, "已触发 Agnes 免费账号速率限制，请稍等几分钟再试")
+            raise HTTPException(502, f"Agnes 接口返回 HTTP {e.code}：{last_detail[:400]}")
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(502, f"Agnes 接口调用失败：{e!r}")
+    raise HTTPException(503, "Agnes 视频服务持续拥堵，请稍后再试")
+
+
+# job_id -> 任务状态字典（后台线程执行创建/轮询/落盘，前端轮询此表）
+# status: creating（创建中，含拥堵重试）/ polling（已创建，轮询 Agnes）/ completed /
+#         completed_download_failed / failed
+_video_jobs: dict[str, dict] = {}
+
+
+def _agnes_video_status(video_id: str) -> dict:
+    """轮询一次 Agnes 任务状态"""
+    url = f"{VIDEO_POLL_BASE}?video_id={quote(video_id)}&model_name={MODEL_VIDEO}"
+    req = urllib.request.Request(url, method="GET")
+    req.add_header("Authorization", "Bearer " + AGNES_KEY)
+    try:
+        with urllib.request.urlopen(req, timeout=VIDEO_TIMEOUT) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", "replace")
+        try:
+            raw = json.loads(raw)
+        except Exception:
+            pass
+        raise HTTPException(502, f"Agnes 轮询接口返回 HTTP {e.code}：{json.dumps(raw, ensure_ascii=False)[:300]}")
+    except Exception as e:
+        raise HTTPException(502, f"Agnes 轮询接口调用失败：{e!r}")
+
+
+def _run_video_job(job_id: str, payload: dict):
+    """后台线程：创建任务（含重试）→ 轮询 → 完成后立即下载落盘"""
+    job = _video_jobs[job_id]
+    t0 = job["t0"]
+    try:
+        vid = _agnes_create_video(payload, job)
+        job["video_id"] = vid
+        job["status"] = "polling"
+        print(f"[ 视频任务 {job_id[:8]} ] 已创建 video_id={vid}", flush=True)
+
+        while time.time() - t0 < VIDEO_MAX_WAIT:
+            resp = _agnes_video_status(vid)
+            status = resp.get("status", "")
+            job["progress"] = resp.get("progress", 0)
+            job["raw_status"] = status
+            if status == "completed":
+                url = resp.get("url") or ""
+                job["source_url"] = url
+                if url:
+                    try:
+                        data, ctype = _download(url)
+                        name = _save(data, "video/mp4", "v")
+                        job["file"] = name
+                        job["bytes"] = len(data)
+                        job["status"] = "completed"
+                        job["elapsed"] = round(time.time() - t0, 1)
+                        print(f"[ 视频任务 {job_id[:8]} ] 完成并落盘 {name}", flush=True)
+                    except HTTPException as e:
+                        job["status"] = "completed_download_failed"
+                        job["error"] = str(e.detail)
+                        job["elapsed"] = round(time.time() - t0, 1)
+                else:
+                    job["status"] = "failed"
+                    job["error"] = "任务完成但 Agnes 未返回结果 URL"
+                return
+            if status in ("failed", "cancelled"):
+                job["status"] = "failed"
+                job["error"] = resp.get("error") or resp.get("message") or status
+                job["elapsed"] = round(time.time() - t0, 1)
+                return
+            time.sleep(VIDEO_POLL_INTERVAL)
+        job["status"] = "failed"
+        job["error"] = f"轮询超时（已等待 {VIDEO_MAX_WAIT} 秒）"
+        job["elapsed"] = round(time.time() - t0, 1)
+    except HTTPException as e:
+        job["status"] = "failed"
+        job["error"] = str(e.detail)
+        job["elapsed"] = round(time.time() - t0, 1)
+    except Exception as e:
+        job["status"] = "failed"
+        job["error"] = repr(e)
+        job["elapsed"] = round(time.time() - t0, 1)
+
+
+def _start_video_job(payload: dict, expected: str) -> dict:
+    """立即返回 job_id，后台线程干活——创建重试不再阻塞请求"""
+    _check_key()
+    job_id = uuid.uuid4().hex
+    _video_jobs[job_id] = {
+        "status": "creating", "video_id": "", "progress": 0,
+        "create_attempt": 0, "file": "", "bytes": 0, "source_url": "",
+        "error": "", "elapsed": 0.0, "expected": expected,
+        "t0": time.time(),
+    }
+    thread = threading.Thread(target=_run_video_job, args=(job_id, payload), daemon=True)
+    thread.start()
+    return {"ok": True, "job_id": job_id, "expected": expected}
+
+
+@app.post("/api/video/text2video")
+def text_to_video(body: TextToVideoBody):
+    """文生视频（text 模式，禁止任何媒体字段）"""
+    _check_video_params(body.seconds, body.aspect_ratio)
+    if not body.prompt.strip():
+        raise HTTPException(400, "提示词不能为空")
+    return _start_video_job({
+        "model": MODEL_VIDEO,
+        "prompt": body.prompt,
+        "size": "720P",
+        "seconds": body.seconds,
+        "aspect_ratio": body.aspect_ratio,
+        "mode": "text",
+    }, VIDEO_DIMS[body.aspect_ratio])
+
+
+@app.post("/api/video/keyframe")
+def keyframe_video(body: KeyframeVideoBody):
+    """首尾帧生视频（keyframe 模式，首/尾帧至少一个）"""
+    _check_video_params(body.seconds, body.aspect_ratio)
+    if not body.prompt.strip():
+        raise HTTPException(400, "提示词不能为空")
+    payload = {
+        "model": MODEL_VIDEO,
+        "prompt": body.prompt,
+        "size": "720P",
+        "seconds": body.seconds,
+        "aspect_ratio": body.aspect_ratio,
+        "mode": "keyframe",
+        "first_frame": _check_media(body.first_frame, "first_frame", "image"),
+    }
+    if body.last_frame.strip():
+        payload["last_frame"] = _check_media(body.last_frame, "last_frame", "image")
+    return _start_video_job(payload, VIDEO_DIMS[body.aspect_ratio])
+
+
+@app.post("/api/video/reference")
+def reference_video(body: ReferenceVideoBody):
+    """图生视频 / 音频参考（reference 模式，images≤5、audios≤3，不支持 videos）"""
+    _check_video_params(body.seconds, body.aspect_ratio)
+    if not body.prompt.strip():
+        raise HTTPException(400, "提示词不能为空")
+    if not body.images and not body.audios:
+        raise HTTPException(400, "reference 模式至少需要 1 张图片或 1 段音频")
+    if len(body.images) > 5:
+        raise HTTPException(400, "图片引用最多 5 张")
+    if len(body.audios) > 3:
+        raise HTTPException(400, "音频引用最多 3 段")
+    payload = {
+        "model": MODEL_VIDEO,
+        "prompt": body.prompt,
+        "size": "720P",
+        "seconds": body.seconds,
+        "aspect_ratio": body.aspect_ratio,
+        "mode": "reference",
+    }
+    if body.images:
+        payload["images"] = [_check_media(x, f"images[{i}]", "image") for i, x in enumerate(body.images)]
+    if body.audios:
+        payload["audios"] = [_check_media(x, f"audios[{i}]", "audio") for i, x in enumerate(body.audios)]
+    return _start_video_job(payload, VIDEO_DIMS[body.aspect_ratio])
+
+
+@app.get("/api/video/status/{key}")
+def video_status(key: str):
+    """查询视频任务状态。key 为 job_id（新）或 video_id（兼容旧卡片/脚本）。
+    completed 时返回落盘文件；completed_download_failed 时附原始 URL 供兜底。"""
+    job = _video_jobs.get(key)
+    if job is None:
+        # 兼容：传入的是 Agnes video_id —— 直接查一次上游；
+        # 若也查不到（如服务重启后内存注册表已清空），明确告知而非报错
+        try:
+            resp = _agnes_video_status(key)
+        except HTTPException:
+            return {"ok": True, "status": "unknown",
+                    "error": "任务记录不存在（服务可能重启过），请重新生成"}
+        status = resp.get("status", "")
+        return {"ok": True, "status": status, "progress": resp.get("progress", 0),
+                "error": resp.get("error") or resp.get("message") or "",
+                "source_url": resp.get("url") or ""}
+    out = {
+        "ok": True,
+        "status": job["status"],
+        "progress": job.get("progress", 0),
+        "create_attempt": job.get("create_attempt", 0),
+        "video_id": job.get("video_id", ""),
+        "error": job.get("error", ""),
+        "source_url": job.get("source_url", ""),
+        "elapsed": job.get("elapsed", 0),
+        "expected": job.get("expected", ""),
+    }
+    if job["status"] == "completed" and job.get("file"):
+        out["file"] = job["file"]
+        out["src"] = f"/api/files/{job['file']}"
+        out["bytes"] = job.get("bytes", 0)
+    return out
 
 
 # ---------- 结果文件 ----------

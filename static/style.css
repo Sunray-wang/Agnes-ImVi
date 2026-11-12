@@ -256,6 +256,27 @@ textarea::placeholder { color: var(--text-3); }
 }
 .thumb-del:hover { background: #c93a3f; }
 
+/* 音频缩略图 */
+.thumb-audio {
+  display: grid;
+  place-items: center;
+  background: var(--accent-soft);
+}
+.thumb-audio .audio-icon { font-size: 26px; color: var(--accent); }
+.thumb-name {
+  position: absolute;
+  left: 4px; right: 4px; bottom: 4px;
+  background: rgba(0, 0, 0, .62);
+  color: #fff;
+  font-size: 10px;
+  border-radius: 4px;
+  padding: 1px 5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.thumb-audio .thumb-order { z-index: 1; }
+
 /* 参数行 */
 .params {
   display: flex;
@@ -374,6 +395,19 @@ select:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px
   display: block;
 }
 
+/* 视频结果卡 */
+.result-card .video-wrap {
+  background: #101318;
+  display: grid;
+  place-items: center;
+  min-height: 140px;
+}
+.result-card video {
+  width: 100%;
+  max-height: 300px;
+  display: block;
+}
+
 .result-meta {
   padding: 10px 12px;
   border-top: 1px solid var(--border);
@@ -407,6 +441,41 @@ select:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px
 }
 @keyframes shimmer { to { background-position: -200% 0; } }
 .skeleton .sk-line { height: 12px; margin: 12px; border-radius: 4px; background: #eef0f3; }
+
+/* 视频任务进度卡 */
+.video-progress-box {
+  padding: 28px 20px 22px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  text-align: center;
+}
+.vp-spinner {
+  width: 30px; height: 30px;
+  border: 3px solid var(--accent-soft);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin .8s linear infinite;
+}
+.vp-status { font-size: 13px; font-weight: 600; color: var(--text); font-variant-numeric: tabular-nums; }
+.vp-bar {
+  width: 100%;
+  max-width: 300px;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  overflow: hidden;
+}
+.vp-bar-fill {
+  height: 100%;
+  width: 0;
+  border-radius: 999px;
+  background: linear-gradient(90deg, var(--accent), #8b5cf6);
+  transition: width .4s ease;
+}
+.vp-hint { font-size: 11px; color: var(--text-3); }
 
 /* ============ Toast ============ */
 .toast {

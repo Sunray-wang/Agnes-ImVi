@@ -20,11 +20,11 @@
       <a class="nav-item active" data-page="t2i">文生图</a>
       <a class="nav-item" data-page="i2i">图生图</a>
       <a class="nav-item" data-page="multi">多图合成</a>
-      <div class="nav-group">视频生成 <span class="nav-badge" id="videoBadge">队列拥堵</span></div>
-      <a class="nav-item disabled" data-page="t2v">文生视频</a>
-      <a class="nav-item disabled" data-page="kf">首尾帧生视频</a>
-      <a class="nav-item disabled" data-page="ref">图生视频</a>
-      <a class="nav-item disabled" data-page="audio">音频参考</a>
+      <div class="nav-group">视频生成 <span class="nav-badge" id="videoBadge">720P · 4–12 秒</span></div>
+      <a class="nav-item" data-page="t2v">文生视频</a>
+      <a class="nav-item" data-page="kf">首尾帧生视频</a>
+      <a class="nav-item" data-page="ref">图生视频</a>
+      <a class="nav-item" data-page="audio">音频参考</a>
     </nav>
     <div class="sidebar-foot">
       <span class="dot" id="keyDot"></span><span id="keyText">Key 检测中…</span>
@@ -136,10 +136,165 @@
       <div class="results" id="multi-results"></div>
     </section>
 
+    <!-- 文生视频 -->
+    <section class="page" id="page-t2v">
+      <header class="page-head">
+        <h1>文生视频</h1>
+        <p>用文字描述生成视频。固定 720P，时长 4–12 秒；任务异步执行，页面会自动轮询进度。</p>
+      </header>
+      <div class="panel">
+        <div class="chips" id="t2v-chips"></div>
+        <textarea id="t2v-prompt" rows="4" placeholder="例如：一只橘色小猫慢慢走过洒满阳光的窗台，毛发被微风轻轻吹动，电影感浅景深，镜头缓慢横移"></textarea>
+        <div class="params">
+          <div class="param">
+            <label>时长（秒）</label>
+            <select id="t2v-seconds"></select>
+          </div>
+          <div class="param">
+            <label>宽高比</label>
+            <select id="t2v-ratio"></select>
+          </div>
+          <div class="param param-dims">
+            <label>输出尺寸</label>
+            <div class="dims" id="t2v-dims">—</div>
+          </div>
+        </div>
+        <button class="btn primary" id="t2v-go">生成视频</button>
+      </div>
+      <div class="results" id="t2v-results"></div>
+    </section>
+
+    <!-- 首尾帧生视频 -->
+    <section class="page" id="page-kf">
+      <header class="page-head">
+        <h1>首尾帧生视频</h1>
+        <p>给定首帧（必填）和尾帧（可选），生成从首帧过渡到尾帧的视频。固定 720P，时长 4–12 秒。</p>
+      </header>
+      <div class="panel">
+        <div class="chips" id="kf-chips"></div>
+        <textarea id="kf-prompt" rows="4" placeholder="例如：小猫从窗台站起身，缓缓走向镜头，最后看向观众，动作自然连贯，光照保持一致"></textarea>
+        <div class="upload-row">
+          <div class="upload" id="kfFirst-drop">
+            <input type="file" id="kfFirst-file" accept="image/*" hidden>
+            <div class="upload-icon">＋</div>
+            <p>首帧（必填）</p>
+            <span>点击选择或拖入图片</span>
+          </div>
+          <div class="thumbs" id="kfFirst-thumbs"></div>
+          <div class="upload" id="kfLast-drop">
+            <input type="file" id="kfLast-file" accept="image/*" hidden>
+            <div class="upload-icon">＋</div>
+            <p>尾帧（可选）</p>
+            <span>点击选择或拖入图片</span>
+          </div>
+          <div class="thumbs" id="kfLast-thumbs"></div>
+        </div>
+        <div class="params">
+          <div class="param">
+            <label>时长（秒）</label>
+            <select id="kf-seconds"></select>
+          </div>
+          <div class="param">
+            <label>宽高比</label>
+            <select id="kf-ratio"></select>
+          </div>
+          <div class="param param-dims">
+            <label>输出尺寸</label>
+            <div class="dims" id="kf-dims">—</div>
+          </div>
+        </div>
+        <button class="btn primary" id="kf-go">生成视频</button>
+      </div>
+      <div class="results" id="kf-results"></div>
+    </section>
+
+    <!-- 图生视频 -->
+    <section class="page" id="page-ref">
+      <header class="page-head">
+        <h1>图生视频</h1>
+        <p>用 1–5 张参考图生成视频，提示词中以「第 N 张」指代对应图片。固定 720P，时长 4–12 秒。</p>
+      </header>
+      <div class="panel">
+        <div class="chips" id="ref-chips"></div>
+        <textarea id="ref-prompt" rows="4" placeholder="例如：第 1 张图的小猫从窗台跳下，伸个懒腰后慢慢走远，尾巴轻轻摇摆，背景阳光摇曳，电影感"></textarea>
+        <div class="upload-row">
+          <div class="upload" id="ref-drop">
+            <input type="file" id="ref-file" accept="image/*" multiple hidden>
+            <div class="upload-icon">＋</div>
+            <p>点击选择或拖入参考图（1–5 张）</p>
+            <span>按上传顺序作为「第 N 张」在提示词中指代</span>
+          </div>
+          <div class="thumbs" id="ref-thumbs"></div>
+        </div>
+        <div class="params">
+          <div class="param">
+            <label>时长（秒）</label>
+            <select id="ref-seconds"></select>
+          </div>
+          <div class="param">
+            <label>宽高比</label>
+            <select id="ref-ratio"></select>
+          </div>
+          <div class="param param-dims">
+            <label>输出尺寸</label>
+            <div class="dims" id="ref-dims">—</div>
+          </div>
+        </div>
+        <button class="btn primary" id="ref-go">生成视频</button>
+      </div>
+      <div class="results" id="ref-results"></div>
+    </section>
+
+    <!-- 音频参考 -->
+    <section class="page" id="page-audio">
+      <header class="page-head">
+        <h1>音频参考</h1>
+        <p>用 1–5 张图片 + 1–3 段音频生成视频，提示词中以「第 N 张」/「音频 N」指代。固定 720P，时长 4–12 秒。</p>
+      </header>
+      <div class="panel">
+        <div class="chips" id="audio-chips"></div>
+        <textarea id="audio-prompt" rows="4" placeholder="例如：第 1 张图的小猫随着音频 1 的节奏轻轻摇摆脑袋，画面温馨可爱，光照自然"></textarea>
+        <div class="upload-row">
+          <div class="upload" id="audioImg-drop">
+            <input type="file" id="audioImg-file" accept="image/*" multiple hidden>
+            <div class="upload-icon">＋</div>
+            <p>点击选择或拖入参考图（1–5 张）</p>
+            <span>按上传顺序作为「第 N 张」在提示词中指代</span>
+          </div>
+          <div class="thumbs" id="audioImg-thumbs"></div>
+        </div>
+        <div class="upload-row">
+          <div class="upload" id="audioSnd-drop">
+            <input type="file" id="audioSnd-file" accept="audio/*" multiple hidden>
+            <div class="upload-icon">♪</div>
+            <p>点击选择或拖入音频（1–3 段）</p>
+            <span>按上传顺序作为「音频 N」在提示词中指代</span>
+          </div>
+          <div class="thumbs" id="audioSnd-thumbs"></div>
+        </div>
+        <div class="params">
+          <div class="param">
+            <label>时长（秒）</label>
+            <select id="audio-seconds"></select>
+          </div>
+          <div class="param">
+            <label>宽高比</label>
+            <select id="audio-ratio"></select>
+          </div>
+          <div class="param param-dims">
+            <label>输出尺寸</label>
+            <div class="dims" id="audio-dims">—</div>
+          </div>
+        </div>
+        <button class="btn primary" id="audio-go">生成视频</button>
+      </div>
+      <div class="results" id="audio-results"></div>
+    </section>
+
   </main>
 </div>
 
 <div class="toast" id="toast" hidden></div>
-<script src="/static/app.js"></script>
+<script src="/static/app.js?v=4"></script>
 </body>
 </html>
